@@ -3,7 +3,7 @@ import csv
 import json
 import math
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -12,38 +12,80 @@ import pyotp
 
 # ============================================================
 # CAS SIGNAL ENGINE
-# 3:00 PM -> 3:17 PM collection
-# 3:17 PM -> prediction locked
-# 3:30 PM -> outcome + calibration
+#
+# 14:58  -> start / initialize
+# 15:00  -> collection begins
+# 15:15  -> exact baseline snapshot selected
+# 15:17  -> prediction locked
+# 15:30  -> outcome + calibration
+#
+# NO ORDERS ARE PLACED.
+# This system only generates signals and Telegram alerts.
 # ============================================================
 
 IST = ZoneInfo("Asia/Kolkata")
+
+API = "https://api.dhan.co/v2"
+
+DATA_DIR = "data"
+CALIBRATION_FILE = os.path.join(DATA_DIR, "calibration.jsonl")
+STATE_FILE = os.path.join(DATA_DIR, "cas_state.json")
 
 DHAN_CLIENT_ID = os.environ["DHAN_CLIENT_ID"]
 DHAN_PIN = os.environ["DHAN_PIN"]
 DHAN_TOTP_SECRET = os.environ["DHAN_TOTP_SECRET"]
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1001276343")
+TELEGRAM_CHAT_ID = os.environ.get(
+    "TELEGRAM_CHAT_ID",
+    "1001276343"
+)
 
+# Optional AI layer.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get(
+    "OPENAI_MODEL",
+    "gpt-5.6-luna"
+)
 
-# Dhan index IDs.
-# NIFTY = 13 is documented by Dhan.
-# SENSEX can be overridden through GitHub environment variables.
-NIFTY_ID = int(os.environ.get("DHAN_NIFTY_ID", "13"))
-SENSEX_ID = int(os.environ.get("DHAN_SENSEX_ID", "51"))
+# Dhan underlying IDs.
+# NIFTY  = 13
+# SENSEX = 51 is configurable because the underlying ID
+# should be verified against the user's Dhan instrument master.
+NIFTY_ID = int(
+    os.environ.get("DHAN_NIFTY_ID", "13")
+)
+
+SENSEX_ID = int(
+    os.environ.get("DHAN_SENSEX_ID", "51")
+)
 
 INDEX_SEGMENT = "IDX_I"
 
-API = "https://api.dhan.co/v2"
+# Collection settings.
+COLLECTION_START = (15, 0)
+PREDICTION_TIME = (15, 17)
+BASELINE_TIME = (15, 15)
+OUTCOME_TIME = (15, 30)
 
-DATA_DIR = "data"
-CALIBRATION_FILE = os.path.join(DATA_DIR, "calibration.jsonl")
+# Snapshot interval.
+# Dhan market quote is rate-limited to 1 request/sec.
+# We deliberately use 5 seconds to reduce API pressure.
+SNAPSHOT_SECONDS = 5
+
+# Calibration.
+MIN_CALIBRATION_SAMPLES = 25
+
+# Meaningful 15:15 -> 15:30 move.
+# Below this = effectively noise / mixed.
+OUTCOME_THRESHOLD_PCT = 0.08
+
+# Signal threshold.
+SIGNAL_THRESHOLD = 0.16
 
 
 # ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 
 def now_ist():
@@ -52,12 +94,16 @@ def now_ist():
 
 def sleep_until(target):
     while True:
-        remaining = (target - now_ist()).total_seconds()
+        seconds = (
+            target - now_ist()
+        ).total_seconds()
 
-        if remaining <= 0:
+        if seconds <= 0:
             return
 
-        time.sleep(min(remaining, 2))
+        time.sleep(
+            min(seconds, 2)
+        )
 
 
 def safe_float(value, default=0.0):
@@ -75,20 +121,51 @@ def safe_int(value, default=0):
 
 
 def clamp(value, low=-1.0, high=1.0):
-    return max(low, min(high, value))
-
-
-def pct_change(a, b):
-    if not a:
-        return 0.0
-    return ((b - a) / a) * 100.0
+    return max(
+        low,
+        min(high, value)
+    )
 
 
 def mean(values):
-    values = [x for x in values if x is not None]
+    values = [
+        x for x in values
+        if x is not None
+    ]
+
     if not values:
         return 0.0
+
     return sum(values) / len(values)
+
+
+def pct_change(old, new):
+    if not old or old == 0:
+        return 0.0
+
+    return (
+        (new - old) / old
+    ) * 100.0
+
+
+def normalize(value, scale):
+    if scale == 0:
+        return 0.0
+
+    return clamp(
+        value / scale
+    )
+
+
+def timestamp():
+    return now_ist().isoformat()
+
+
+def ensure_data_dir():
+    os.makedirs(
+        DATA_DIR,
+        exist_ok=True
+    )
 
 
 # ============================================================
@@ -100,24 +177,35 @@ def dhan_access_token():
     Generate a fresh 24-hour Dhan access token using TOTP.
     """
 
-    totp = pyotp.TOTP(DHAN_TOTP_SECRET).now()
+    totp = pyotp.TOTP(
+        DHAN_TOTP_SECRET
+    ).now()
 
     url = (
-        "https://auth.dhan.co/app/generateAccessToken"
+        "https://auth.dhan.co/app/"
+        "generateAccessToken"
         f"?dhanClientId={DHAN_CLIENT_ID}"
         f"&pin={DHAN_PIN}"
         f"&totp={totp}"
     )
 
-    response = requests.post(url, timeout=20)
+    response = requests.post(
+        url,
+        timeout=20
+    )
+
     response.raise_for_status()
 
     data = response.json()
 
-    token = data.get("accessToken")
+    token = data.get(
+        "accessToken"
+    )
 
     if not token:
-        raise RuntimeError(f"Dhan authentication failed: {data}")
+        raise RuntimeError(
+            f"Dhan authentication failed: {data}"
+        )
 
     return token
 
@@ -133,127 +221,194 @@ class Dhan:
             "client-id": DHAN_CLIENT_ID,
         }
 
-    def post(self, endpoint, payload):
+    def post(
+        self,
+        endpoint,
+        payload
+    ):
         url = API + endpoint
 
         response = requests.post(
             url,
             headers=self.headers,
             json=payload,
-            timeout=20,
+            timeout=20
         )
 
         if response.status_code >= 400:
             raise RuntimeError(
                 f"Dhan API {endpoint} "
-                f"{response.status_code}: {response.text[:1000]}"
+                f"{response.status_code}: "
+                f"{response.text[:1000]}"
             )
 
         return response.json()
 
-    def expiry_list(self, security_id, segment):
+    def expiry_list(
+        self,
+        security_id,
+        segment
+    ):
         return self.post(
             "/optionchain/expirylist",
             {
                 "UnderlyingScrip": security_id,
                 "UnderlyingSeg": segment,
-            },
+            }
         )
 
-    def option_chain(self, security_id, segment, expiry):
+    def option_chain(
+        self,
+        security_id,
+        segment,
+        expiry
+    ):
         return self.post(
             "/optionchain",
             {
                 "UnderlyingScrip": security_id,
                 "UnderlyingSeg": segment,
                 "Expiry": expiry,
-            },
+            }
         )
 
-    def quote(self, securities):
+    def quote(
+        self,
+        securities
+    ):
         return self.post(
             "/marketfeed/quote",
-            securities,
+            securities
         )
 
 
 # ============================================================
-# DHAN RESPONSE NORMALIZATION
+# RESPONSE HELPERS
 # ============================================================
 
 def unwrap_data(response):
     if not isinstance(response, dict):
         return {}
 
-    return response.get("data", response)
+    return response.get(
+        "data",
+        response
+    )
 
 
 def extract_expiries(response):
     data = unwrap_data(response)
 
     if isinstance(data, list):
-        return [str(x) for x in data]
+        return [
+            str(x)
+            for x in data
+        ]
 
-    for key in ("expiry", "expiries", "Expiry", "ExpiryList"):
-        if key in data and isinstance(data[key], list):
-            return [str(x) for x in data[key]]
+    if not isinstance(data, dict):
+        return []
+
+    for key in (
+        "expiry",
+        "expiries",
+        "Expiry",
+        "ExpiryList"
+    ):
+        value = data.get(key)
+
+        if isinstance(value, list):
+            return [
+                str(x)
+                for x in value
+            ]
 
     return []
 
 
-def first_valid_expiry(dhan, security_id):
+def parse_expiry_date(value):
+    try:
+        return datetime.strptime(
+            str(value)[:10],
+            "%Y-%m-%d"
+        ).date()
+    except Exception:
+        return None
+
+
+def first_valid_expiry(
+    dhan,
+    security_id
+):
     response = dhan.expiry_list(
         security_id,
-        INDEX_SEGMENT,
+        INDEX_SEGMENT
     )
 
-    expiries = extract_expiries(response)
+    expiries = extract_expiries(
+        response
+    )
 
     if not expiries:
         raise RuntimeError(
-            f"No expiry returned for underlying {security_id}: {response}"
+            f"No expiry returned for "
+            f"underlying {security_id}"
         )
 
     today = now_ist().date()
 
     parsed = []
 
-    for value in expiries:
-        try:
-            d = datetime.strptime(value[:10], "%Y-%m-%d").date()
-            parsed.append((d, value))
-        except Exception:
-            continue
+    for expiry in expiries:
+        expiry_date = parse_expiry_date(
+            expiry
+        )
 
-    future = [x for x in parsed if x[0] >= today]
+        if expiry_date:
+            parsed.append(
+                (
+                    expiry_date,
+                    expiry
+                )
+            )
+
+    future = [
+        x for x in parsed
+        if x[0] >= today
+    ]
 
     if future:
-        future.sort()
+        future.sort(
+            key=lambda x: x[0]
+        )
+
         return future[0][1]
 
     return expiries[0]
 
 
 # ============================================================
-# OPTION CHAIN PARSING
+# OPTION CHAIN
 # ============================================================
 
 def find_chain_rows(response):
     data = unwrap_data(response)
 
-    # Dhan commonly returns a strike-wise dictionary.
-    if "oc" in data and isinstance(data["oc"], dict):
-        return data["oc"]
+    if not isinstance(data, dict):
+        return {}
 
-    if "data" in data and isinstance(data["data"], dict):
-        if "oc" in data["data"]:
-            return data["data"]["oc"]
+    if isinstance(
+        data.get("oc"),
+        dict
+    ):
+        return data["oc"]
 
     return data
 
 
 def parse_option_rows(response):
-    rows = find_chain_rows(response)
+    rows = find_chain_rows(
+        response
+    )
 
     output = []
 
@@ -266,67 +421,77 @@ def parse_option_rows(response):
             continue
 
         strike = safe_float(
-            item.get("strike_price", strike_key)
+            item.get(
+                "strike_price",
+                strike_key
+            )
         )
 
-        ce = item.get("ce") or item.get("CE") or {}
-        pe = item.get("pe") or item.get("PE") or {}
+        ce = (
+            item.get("ce")
+            or item.get("CE")
+            or {}
+        )
 
-        if ce:
+        pe = (
+            item.get("pe")
+            or item.get("PE")
+            or {}
+        )
+
+        if isinstance(ce, dict) and ce:
             output.append({
                 "strike": strike,
                 "side": "CE",
-                **ce,
+                **ce
             })
 
-        if pe:
+        if isinstance(pe, dict) and pe:
             output.append({
                 "strike": strike,
                 "side": "PE",
-                **pe,
+                **pe
             })
 
     return output
 
 
-def build_atm_contracts(dhan, security_id, label):
+def build_atm_contracts(
+    dhan,
+    security_id,
+    label
+):
     expiry = first_valid_expiry(
         dhan,
-        security_id,
+        security_id
     )
 
     chain = dhan.option_chain(
         security_id,
         INDEX_SEGMENT,
-        expiry,
+        expiry
     )
 
-    rows = parse_option_rows(chain)
+    data = unwrap_data(
+        chain
+    )
+
+    spot = safe_float(
+        data.get(
+            "last_price",
+            0
+        )
+    )
+
+    rows = parse_option_rows(
+        chain
+    )
 
     if not rows:
         raise RuntimeError(
-            f"No option-chain rows for {label}"
+            f"No option-chain rows "
+            f"for {label}"
         )
-
-    spot = safe_float(
-        unwrap_data(chain).get("last_price", 0)
-    )
-
-    if spot <= 0:
-        # Calculate approximate spot from option strikes
-        # only as fallback.
-        strikes = [
-            r["strike"]
-            for r in rows
-            if r.get("strike")
-        ]
-
-        if not strikes:
-            raise RuntimeError(
-                f"Unable to determine spot for {label}"
-            )
-
-        spot = mean(strikes)
 
     strikes = sorted(
         set(
@@ -336,20 +501,58 @@ def build_atm_contracts(dhan, security_id, label):
         )
     )
 
+    if not strikes:
+        raise RuntimeError(
+            f"No strikes available "
+            f"for {label}"
+        )
+
+    # Dhan provides underlying last_price
+    # directly in option-chain response.
+    # Only use mean strike as emergency fallback.
+    if spot <= 0:
+        spot = mean(strikes)
+
     atm = min(
         strikes,
-        key=lambda x: abs(x - spot)
+        key=lambda x:
+        abs(x - spot)
     )
 
-    nearby = sorted(
-        strikes,
-        key=lambda x: abs(x - atm)
-    )[:3]
+    # Find exactly ATM-1, ATM and ATM+1
+    # in the sorted strike ladder.
+    atm_index = strikes.index(atm)
+
+    nearby_indexes = [
+        atm_index - 1,
+        atm_index,
+        atm_index + 1
+    ]
+
+    nearby_indexes = [
+        i for i in nearby_indexes
+        if 0 <= i < len(strikes)
+    ]
+
+    nearby_strikes = [
+        strikes[i]
+        for i in nearby_indexes
+    ]
 
     contracts = []
 
-    for strike in nearby:
-        for side in ("CE", "PE"):
+    option_segment = (
+        "NSE_FNO"
+        if label == "NIFTY"
+        else "BSE_FNO"
+    )
+
+    for strike in nearby_strikes:
+
+        for side in (
+            "CE",
+            "PE"
+        ):
 
             match = next(
                 (
@@ -357,18 +560,22 @@ def build_atm_contracts(dhan, security_id, label):
                     if r["strike"] == strike
                     and r["side"] == side
                 ),
-                None,
+                None
             )
 
             if not match:
                 continue
 
-            security = (
-                match.get("security_id")
-                or match.get("SecurityId")
+            security_id_option = (
+                match.get(
+                    "security_id"
+                )
+                or match.get(
+                    "SecurityId"
+                )
             )
 
-            if not security:
+            if not security_id_option:
                 continue
 
             contracts.append({
@@ -376,13 +583,16 @@ def build_atm_contracts(dhan, security_id, label):
                 "expiry": expiry,
                 "strike": strike,
                 "side": side,
-                "security_id": str(security),
-                "segment": "NSE_FNO" if label == "NIFTY" else "BSE_FNO",
+                "security_id": str(
+                    security_id_option
+                ),
+                "segment": option_segment,
             })
 
     if len(contracts) < 6:
         raise RuntimeError(
-            f"Could not build ATM ±1 contracts for {label}"
+            f"Could not build full "
+            f"ATM ±1 option set for {label}"
         )
 
     return {
@@ -390,16 +600,18 @@ def build_atm_contracts(dhan, security_id, label):
         "spot": spot,
         "atm": atm,
         "expiry": expiry,
-        "contracts": contracts,
+        "contracts": contracts
     }
 
 
 # ============================================================
-# MARKET QUOTE
+# QUOTE NORMALIZATION
 # ============================================================
 
 def quote_to_map(response):
-    data = unwrap_data(response)
+    data = unwrap_data(
+        response
+    )
 
     result = {}
 
@@ -408,80 +620,131 @@ def quote_to_map(response):
 
     for segment, instruments in data.items():
 
-        if not isinstance(instruments, dict):
+        if not isinstance(
+            instruments,
+            dict
+        ):
             continue
 
         for security_id, packet in instruments.items():
 
-            if not isinstance(packet, dict):
+            if not isinstance(
+                packet,
+                dict
+            ):
                 continue
 
-            result[str(security_id)] = {
+            result[
+                str(security_id)
+            ] = {
                 "segment": segment,
-                **packet,
+                **packet
             }
 
     return result
 
 
-def get_quote(dhan, instruments):
+def get_quote(
+    dhan,
+    instruments
+):
     grouped = {}
 
     for instrument in instruments:
-        segment = instrument["segment"]
-        sid = int(instrument["security_id"])
 
-        grouped.setdefault(segment, [])
+        segment = instrument[
+            "segment"
+        ]
 
-        if sid not in grouped[segment]:
-            grouped[segment].append(sid)
+        security_id = safe_int(
+            instrument[
+                "security_id"
+            ]
+        )
+
+        grouped.setdefault(
+            segment,
+            []
+        )
+
+        if security_id not in grouped[
+            segment
+        ]:
+            grouped[
+                segment
+            ].append(
+                security_id
+            )
+
+    if not grouped:
+        return {}
+
+    response = dhan.quote(
+        grouped
+    )
 
     return quote_to_map(
-        dhan.quote(grouped)
+        response
     )
 
 
 def packet_ltp(packet):
     return safe_float(
-        packet.get("last_price")
-        or packet.get("ltp")
+        packet.get(
+            "last_price"
+        )
+        or packet.get(
+            "ltp"
+        )
     )
 
 
 def packet_volume(packet):
     return safe_float(
-        packet.get("volume")
+        packet.get(
+            "volume"
+        )
     )
 
 
 def packet_oi(packet):
     return safe_float(
-        packet.get("oi")
+        packet.get(
+            "oi"
+        )
     )
 
 
-def packet_bid_qty(packet):
+def packet_buy_qty(packet):
     return safe_float(
-        packet.get("buy_quantity")
-        or packet.get("total_buy_quantity")
+        packet.get(
+            "buy_quantity"
+        )
+        or packet.get(
+            "total_buy_quantity"
+        )
     )
 
 
-def packet_ask_qty(packet):
+def packet_sell_qty(packet):
     return safe_float(
-        packet.get("sell_quantity")
-        or packet.get("total_sell_quantity")
+        packet.get(
+            "sell_quantity"
+        )
+        or packet.get(
+            "total_sell_quantity"
+        )
     )
 
-
-# ============================================================
-# MARKET DEPTH / ORDER FLOW
-# ============================================================
 
 def depth_imbalance(packet):
+    buy = packet_buy_qty(
+        packet
+    )
 
-    buy = packet_bid_qty(packet)
-    sell = packet_ask_qty(packet)
+    sell = packet_sell_qty(
+        packet
+    )
 
     total = buy + sell
 
@@ -493,16 +756,8 @@ def depth_imbalance(packet):
     )
 
 
-def volume_delta(previous, current):
-    if current < previous:
-        # Session reset/data correction.
-        return 0.0
-
-    return max(0.0, current - previous)
-
-
 # ============================================================
-# HEAVYWEIGHT UNIVERSE
+# HEAVYWEIGHTS
 # ============================================================
 
 NIFTY_HEAVYWEIGHTS = [
@@ -524,13 +779,7 @@ NIFTY_HEAVYWEIGHTS = [
 ]
 
 
-def load_nse_instrument_master():
-    """
-    Load Dhan's public detailed instrument master.
-
-    This is used only for security IDs.
-    """
-
+def load_instrument_master():
     url = (
         "https://images.dhan.co/api-data/"
         "api-scrip-master-detailed.csv"
@@ -538,62 +787,67 @@ def load_nse_instrument_master():
 
     response = requests.get(
         url,
-        timeout=30,
+        timeout=30
     )
 
     response.raise_for_status()
 
-    rows = csv.DictReader(
+    reader = csv.DictReader(
         response.text.splitlines()
     )
 
     result = {}
 
-    for row in rows:
+    for row in reader:
 
         symbol = (
-            row.get("SEM_TRADING_SYMBOL")
-            or row.get("SEM_CUSTOM_SYMBOL")
-            or row.get("trading_symbol")
+            row.get(
+                "SEM_TRADING_SYMBOL"
+            )
+            or row.get(
+                "SEM_CUSTOM_SYMBOL"
+            )
+            or ""
+        ).strip().upper()
+
+        security_id = (
+            row.get(
+                "SEM_SMST_SECURITY_ID"
+            )
+            or row.get(
+                "security_id"
+            )
             or ""
         ).strip()
 
-        segment = (
-            row.get("SEM_EXM_EXCH_ID")
-            or row.get("SEM_SEGMENT")
+        exchange = (
+            row.get(
+                "SEM_EXM_EXCH_ID"
+            )
             or ""
-        ).upper()
+        ).strip().upper()
 
-        security_id = (
-            row.get("SEM_SMST_SECURITY_ID")
-            or row.get("security_id")
-            or ""
-        )
-
-        if not symbol or not security_id:
-            continue
-
-        if segment not in ("NSE", "NSE_EQ"):
-            continue
-
-        clean = symbol.upper()
-
-        if clean in NIFTY_HEAVYWEIGHTS:
-            result[clean] = {
-                "security_id": str(security_id),
-                "segment": "NSE_EQ",
+        if (
+            symbol
+            and security_id
+            and exchange == "NSE"
+            and symbol in NIFTY_HEAVYWEIGHTS
+        ):
+            result[symbol] = {
+                "security_id": security_id,
+                "segment": "NSE_EQ"
             }
 
     return result
 
 
-def build_heavyweight_instruments():
+def build_heavyweights():
     try:
-        master = load_nse_instrument_master()
+        master = load_instrument_master()
     except Exception as exc:
         print(
-            "Heavyweight master unavailable:",
-            exc,
+            "Instrument master error:",
+            exc
         )
         return []
 
@@ -601,61 +855,95 @@ def build_heavyweight_instruments():
 
     for symbol in NIFTY_HEAVYWEIGHTS:
 
-        if symbol not in master:
+        item = master.get(
+            symbol
+        )
+
+        if not item:
             continue
 
         instruments.append({
             "symbol": symbol,
-            "security_id": master[symbol]["security_id"],
-            "segment": "NSE_EQ",
+            "security_id": item[
+                "security_id"
+            ],
+            "segment": "NSE_EQ"
         })
 
     return instruments
 
 
 # ============================================================
-# SNAPSHOT COLLECTION
+# SNAPSHOT
 # ============================================================
 
 def make_snapshot(
     quote,
     index_instruments,
     option_contracts,
-    heavyweight_instruments,
+    heavyweight_instruments
 ):
-
     snapshot = {
-        "timestamp": now_ist().isoformat(),
+        "timestamp": timestamp(),
         "indices": {},
         "options": {},
-        "heavyweights": {},
+        "heavyweights": {}
     }
 
+    # Index snapshots.
     for instrument in index_instruments:
 
-        sid = instrument["security_id"]
-
-        packet = quote.get(
-            sid,
-            {},
+        sid = str(
+            instrument[
+                "security_id"
+            ]
         )
 
-        snapshot["indices"][instrument["label"]] = {
-            "ltp": packet_ltp(packet),
-            "volume": packet_volume(packet),
-            "oi": packet_oi(packet),
-            "imbalance": depth_imbalance(packet),
-            "buy_qty": packet_bid_qty(packet),
-            "sell_qty": packet_ask_qty(packet),
+        packet = quote.get(
+            sid,
+            {}
+        )
+
+        snapshot[
+            "indices"
+        ][
+            instrument["label"]
+        ] = {
+            "ltp": packet_ltp(
+                packet
+            ),
+            "volume": packet_volume(
+                packet
+            ),
+            "oi": packet_oi(
+                packet
+            ),
+            "imbalance":
+                depth_imbalance(
+                    packet
+                ),
+            "buy_qty":
+                packet_buy_qty(
+                    packet
+                ),
+            "sell_qty":
+                packet_sell_qty(
+                    packet
+                )
         }
 
+    # Option snapshots.
     for contract in option_contracts:
 
-        sid = contract["security_id"]
+        sid = str(
+            contract[
+                "security_id"
+            ]
+        )
 
         packet = quote.get(
             sid,
-            {},
+            {}
         )
 
         key = (
@@ -664,490 +952,836 @@ def make_snapshot(
             f'{contract["side"]}'
         )
 
-        snapshot["options"][key] = {
-            "label": contract["label"],
-            "strike": contract["strike"],
-            "side": contract["side"],
-            "security_id": sid,
-            "ltp": packet_ltp(packet),
-            "volume": packet_volume(packet),
-            "oi": packet_oi(packet),
-            "imbalance": depth_imbalance(packet),
-            "buy_qty": packet_bid_qty(packet),
-            "sell_qty": packet_ask_qty(packet),
+        snapshot[
+            "options"
+        ][key] = {
+            "label":
+                contract["label"],
+            "strike":
+                contract["strike"],
+            "side":
+                contract["side"],
+            "ltp":
+                packet_ltp(packet),
+            "volume":
+                packet_volume(packet),
+            "oi":
+                packet_oi(packet),
+            "imbalance":
+                depth_imbalance(packet),
+            "buy_qty":
+                packet_buy_qty(packet),
+            "sell_qty":
+                packet_sell_qty(packet)
         }
 
-    for stock in heavyweight_instruments:
+    # Heavyweights.
+    for instrument in heavyweight_instruments:
 
-        sid = stock["security_id"]
+        sid = str(
+            instrument[
+                "security_id"
+            ]
+        )
 
         packet = quote.get(
             sid,
-            {},
+            {}
         )
 
-        snapshot["heavyweights"][
-            stock["symbol"]
+        snapshot[
+            "heavyweights"
+        ][
+            instrument["symbol"]
         ] = {
-            "ltp": packet_ltp(packet),
-            "volume": packet_volume(packet),
-            "imbalance": depth_imbalance(packet),
+            "ltp":
+                packet_ltp(packet),
+            "volume":
+                packet_volume(packet),
+            "imbalance":
+                depth_imbalance(packet)
         }
 
     return snapshot
 
 
 # ============================================================
-# FEATURE ENGINEERING
+# SNAPSHOT MATH
 # ============================================================
 
-def option_features(
+def snapshot_time(snapshot):
+    return datetime.fromisoformat(
+        snapshot["timestamp"]
+    )
+
+
+def closest_snapshot(
     snapshots,
-    label,
+    target
 ):
-    rows = []
+    if not snapshots:
+        return None
 
-    for snapshot in snapshots:
+    return min(
+        snapshots,
+        key=lambda s:
+        abs(
+            (
+                snapshot_time(s)
+                - target
+            ).total_seconds()
+        )
+    )
 
-        for key, option in snapshot["options"].items():
 
-            if option["label"] != label:
+def latest_snapshot(
+    snapshots
+):
+    if not snapshots:
+        return None
+
+    return max(
+        snapshots,
+        key=snapshot_time
+    )
+
+
+def delta_volume(
+    previous,
+    current
+):
+    if current < previous:
+        return 0.0
+
+    return max(
+        0.0,
+        current - previous
+    )
+
+
+def delta_oi(
+    previous,
+    current
+):
+    return current - previous
+
+
+def option_flow_features(
+    first,
+    last
+):
+    result = {}
+
+    labels = (
+        "NIFTY",
+        "SENSEX"
+    )
+
+    for label in labels:
+
+        ce_volume = 0.0
+        pe_volume = 0.0
+
+        ce_premium_move = []
+        pe_premium_move = []
+
+        ce_oi_change = 0.0
+        pe_oi_change = 0.0
+
+        ce_imbalance = []
+        pe_imbalance = []
+
+        for key, current in last[
+            "options"
+        ].items():
+
+            if current["label"] != label:
                 continue
 
-            rows.append(
+            previous = first[
+                "options"
+            ].get(key)
+
+            if not previous:
+                continue
+
+            dv = delta_volume(
+                previous["volume"],
+                current["volume"]
+            )
+
+            doi = delta_oi(
+                previous["oi"],
+                current["oi"]
+            )
+
+            premium = pct_change(
+                previous["ltp"],
+                current["ltp"]
+            )
+
+            if current["side"] == "CE":
+
+                ce_volume += dv
+                ce_oi_change += doi
+
+                ce_premium_move.append(
+                    premium
+                )
+
+                ce_imbalance.append(
+                    current["imbalance"]
+                )
+
+            else:
+
+                pe_volume += dv
+                pe_oi_change += doi
+
+                pe_premium_move.append(
+                    premium
+                )
+
+                pe_imbalance.append(
+                    current["imbalance"]
+                )
+
+        total_volume = (
+            ce_volume
+            + pe_volume
+        )
+
+        if total_volume > 0:
+            volume_balance = (
+                ce_volume
+                - pe_volume
+            ) / total_volume
+        else:
+            volume_balance = 0.0
+
+        premium_balance = clamp(
+            (
+                mean(ce_premium_move)
+                - mean(pe_premium_move)
+            ) / 2.0
+        )
+
+        oi_total = (
+            abs(ce_oi_change)
+            + abs(pe_oi_change)
+        )
+
+        if oi_total > 0:
+            # More PE OI relative to CE OI
+            # is treated as bullish evidence.
+            oi_balance = (
+                pe_oi_change
+                - ce_oi_change
+            ) / oi_total
+        else:
+            oi_balance = 0.0
+
+        bid_ask_balance = clamp(
+            (
+                mean(ce_imbalance)
+                - mean(pe_imbalance)
+            )
+        )
+
+        result[label] = {
+            "ce_volume":
+                ce_volume,
+            "pe_volume":
+                pe_volume,
+            "ce_pe_ratio":
                 (
-                    snapshot["timestamp"],
-                    option,
+                    ce_volume / pe_volume
+                    if pe_volume > 0
+                    else (
+                        999.0
+                        if ce_volume > 0
+                        else 1.0
+                    )
+                ),
+            "volume_balance":
+                volume_balance,
+            "premium_balance":
+                premium_balance,
+            "ce_oi_change":
+                ce_oi_change,
+            "pe_oi_change":
+                pe_oi_change,
+            "oi_balance":
+                oi_balance,
+            "bid_ask_balance":
+                bid_ask_balance
+        }
+
+    return result
+
+
+# ============================================================
+# INDEX FEATURES
+# ============================================================
+
+def index_features(
+    first,
+    last
+):
+    result = {}
+
+    for label in (
+        "NIFTY",
+        "SENSEX"
+    ):
+
+        a = first[
+            "indices"
+        ].get(label, {})
+
+        b = last[
+            "indices"
+        ].get(label, {})
+
+        first_ltp = a.get(
+            "ltp",
+            0
+        )
+
+        last_ltp = b.get(
+            "ltp",
+            0
+        )
+
+        return_pct = pct_change(
+            first_ltp,
+            last_ltp
+        )
+
+        imbalance = b.get(
+            "imbalance",
+            0
+        )
+
+        imbalance_change = (
+            imbalance
+            - a.get(
+                "imbalance",
+                0
+            )
+        )
+
+        volume_change = delta_volume(
+            a.get("volume", 0),
+            b.get("volume", 0)
+        )
+
+        result[label] = {
+            "first_ltp":
+                first_ltp,
+            "last_ltp":
+                last_ltp,
+            "return_pct":
+                return_pct,
+            "imbalance":
+                imbalance,
+            "imbalance_change":
+                imbalance_change,
+            "volume_change":
+                volume_change
+        }
+
+    return result
+
+
+# ============================================================
+# HEAVYWEIGHT FEATURES
+# ============================================================
+
+def heavyweight_features(
+    first,
+    last
+):
+    confirmations = []
+
+    total_score = 0.0
+
+    for symbol, current in last[
+        "heavyweights"
+    ].items():
+
+        previous = first[
+            "heavyweights"
+        ].get(symbol)
+
+        if not previous:
+            continue
+
+        old_ltp = previous.get(
+            "ltp",
+            0
+        )
+
+        new_ltp = current.get(
+            "ltp",
+            0
+        )
+
+        move = pct_change(
+            old_ltp,
+            new_ltp
+        )
+
+        imbalance = current.get(
+            "imbalance",
+            0
+        )
+
+        # Price gets the highest influence.
+        score = (
+            clamp(
+                move / 0.20
+            ) * 0.60
+            + imbalance * 0.40
+        )
+
+        total_score += score
+
+        if score > 0.10:
+            confirmations.append(
+                1
+            )
+        elif score < -0.10:
+            confirmations.append(
+                -1
+            )
+        else:
+            confirmations.append(
+                0
+            )
+
+    if confirmations:
+        positive = sum(
+            1 for x in confirmations
+            if x == 1
+        )
+
+        negative = sum(
+            1 for x in confirmations
+            if x == -1
+        )
+
+        usable = (
+            positive
+            + negative
+        )
+
+        breadth = (
+            (positive - negative)
+            / usable
+            if usable
+            else 0.0
+        )
+
+        average_score = (
+            total_score
+            / len(confirmations)
+        )
+    else:
+        positive = 0
+        negative = 0
+        breadth = 0.0
+        average_score = 0.0
+
+    return {
+        "positive":
+            positive,
+        "negative":
+            negative,
+        "breadth":
+            breadth,
+        "average_score":
+            clamp(
+                average_score
+            ),
+        "count":
+            len(confirmations)
+    }
+
+
+# ============================================================
+# WINDOW STRUCTURE / VWAP PROXY
+# ============================================================
+
+def window_features(
+    snapshots,
+    label
+):
+    if not snapshots:
+        return {
+            "high": 0.0,
+            "low": 0.0,
+            "return_pct": 0.0,
+            "vwap": 0.0,
+            "last_price": 0.0,
+            "momentum": 0.0
+        }
+
+    prices = []
+
+    for snapshot in snapshots:
+        item = snapshot[
+            "indices"
+        ].get(label)
+
+        if item and item["ltp"] > 0:
+            prices.append(
+                (
+                    snapshot_time(
+                        snapshot
+                    ),
+                    item["ltp"],
+                    item["volume"]
                 )
             )
 
-    if not rows:
+    if not prices:
         return {
-            "ce_volume": 0,
-            "pe_volume": 0,
-            "ce_acceleration": 0,
-            "pe_acceleration": 0,
-            "ce_price_change": 0,
-            "pe_price_change": 0,
-            "ce_oi_change": 0,
-            "pe_oi_change": 0,
-            "ce_pe_volume_ratio": 1,
-            "flow_score": 0,
+            "high": 0.0,
+            "low": 0.0,
+            "return_pct": 0.0,
+            "vwap": 0.0,
+            "last_price": 0.0,
+            "momentum": 0.0
         }
 
-    first = {}
-    last = {}
+    high = max(
+        x[1] for x in prices
+    )
 
-    for _, option in rows:
+    low = min(
+        x[1] for x in prices
+    )
 
-        key = (
-            option["strike"],
-            option["side"],
+    first_price = prices[0][1]
+    last_price = prices[-1][1]
+
+    # Volume-weighted proxy.
+    # Market Quote volume is cumulative day volume.
+    total_volume = 0.0
+    weighted = 0.0
+
+    previous_volume = prices[0][2]
+
+    for _, price, volume in prices:
+
+        incremental = max(
+            0.0,
+            volume - previous_volume
         )
 
-        if key not in first:
-            first[key] = option
-
-        last[key] = option
-
-    ce_volume = 0
-    pe_volume = 0
-
-    ce_price_changes = []
-    pe_price_changes = []
-
-    ce_oi_changes = []
-    pe_oi_changes = []
-
-    ce_acceleration = 0
-    pe_acceleration = 0
-
-    for key in first:
-
-        f = first[key]
-        l = last[key]
-
-        volume_change = volume_delta(
-            f["volume"],
-            l["volume"],
-        )
-
-        price_change = pct_change(
-            f["ltp"],
-            l["ltp"],
-        )
-
-        oi_change = l["oi"] - f["oi"]
-
-        if key[1] == "CE":
-
-            ce_volume += volume_change
-            ce_price_changes.append(
-                price_change
-            )
-            ce_oi_changes.append(
-                oi_change
+        if incremental > 0:
+            weighted += (
+                price
+                * incremental
             )
 
-        else:
+            total_volume += incremental
 
-            pe_volume += volume_change
-            pe_price_changes.append(
-                price_change
-            )
-            pe_oi_changes.append(
-                oi_change
-            )
+        previous_volume = volume
 
-    # Compare first half vs second half volume velocity.
-    midpoint = len(snapshots) // 2
-
-    first_half = snapshots[:midpoint]
-    second_half = snapshots[midpoint:]
-
-    def side_volume(data, side):
-        total = 0
-
-        for snap in data:
-
-            for option in snap["options"].values():
-
-                if (
-                    option["label"] == label
-                    and option["side"] == side
-                ):
-                    total += option["volume"]
-
-        return total
-
-    ce_first = side_volume(
-        first_half,
-        "CE",
-    )
-
-    ce_second = side_volume(
-        second_half,
-        "CE",
-    )
-
-    pe_first = side_volume(
-        first_half,
-        "PE",
-    )
-
-    pe_second = side_volume(
-        second_half,
-        "PE",
-    )
-
-    ce_acceleration = (
-        (ce_second / max(1, len(second_half)))
-        -
-        (ce_first / max(1, len(first_half)))
-    )
-
-    pe_acceleration = (
-        (pe_second / max(1, len(second_half)))
-        -
-        (pe_first / max(1, len(first_half)))
-    )
-
-    ratio = (
-        pe_volume / max(1.0, ce_volume)
-    )
-
-    # For a directional option-flow signal:
-    # PE buying / PE volume expansion supports bearishness.
-    # CE buying / CE volume expansion supports bullishness.
-    flow = (
-        (pe_volume - ce_volume)
-        / max(
-            1.0,
-            pe_volume + ce_volume,
+    if total_volume > 0:
+        vwap = (
+            weighted
+            / total_volume
         )
-    )
-
-    acceleration = (
-        (pe_acceleration - ce_acceleration)
-        / max(
-            1.0,
-            abs(pe_acceleration)
-            + abs(ce_acceleration),
+    else:
+        vwap = mean(
+            [x[1] for x in prices]
         )
-    )
 
-    flow_score = clamp(
-        0.65 * flow
-        + 0.35 * acceleration
-    )
+    # Last 3 samples = short momentum.
+    recent = prices[-3:]
+
+    if len(recent) >= 2:
+        momentum = pct_change(
+            recent[0][1],
+            recent[-1][1]
+        )
+    else:
+        momentum = 0.0
 
     return {
-        "ce_volume": ce_volume,
-        "pe_volume": pe_volume,
-        "ce_pe_volume_ratio": ratio,
-        "ce_acceleration": ce_acceleration,
-        "pe_acceleration": pe_acceleration,
-        "ce_price_change": mean(
-            ce_price_changes
+        "high": high,
+        "low": low,
+        "return_pct": pct_change(
+            first_price,
+            last_price
         ),
-        "pe_price_change": mean(
-            pe_price_changes
-        ),
-        "ce_oi_change": sum(
-            ce_oi_changes
-        ),
-        "pe_oi_change": sum(
-            pe_oi_changes
-        ),
-        "flow_score": flow_score,
+        "vwap": vwap,
+        "last_price": last_price,
+        "momentum": momentum
     }
 
 
-def index_features(
+# ============================================================
+# REGIME
+# ============================================================
+
+def detect_regime(
     snapshots,
-    label,
+    label
 ):
-    values = [
-        s["indices"][label]
-        for s in snapshots
-        if label in s["indices"]
-    ]
+    wf = window_features(
+        snapshots,
+        label
+    )
 
-    if not values:
-        return {
-            "return": 0,
-            "imbalance": 0,
-            "imbalance_change": 0,
-            "volume_change": 0,
-        }
-
-    first = values[0]
-    last = values[-1]
-
-    return {
-        "return": pct_change(
-            first["ltp"],
-            last["ltp"],
-        ),
-        "imbalance": last["imbalance"],
-        "imbalance_change": (
-            last["imbalance"]
-            - first["imbalance"]
-        ),
-        "volume_change": (
-            last["volume"]
-            - first["volume"]
-        ),
-    }
-
-
-def heavyweight_features(
-    snapshots,
-):
-    names = set()
+    prices = []
 
     for snapshot in snapshots:
-        names.update(
-            snapshot["heavyweights"].keys()
-        )
+        item = snapshot[
+            "indices"
+        ].get(label)
 
-    if not names:
+        if item:
+            if item["ltp"] > 0:
+                prices.append(
+                    item["ltp"]
+                )
+
+    if len(prices) < 3:
         return {
-            "average_imbalance": 0,
-            "confirming": 0,
-            "total": 0,
+            "regime": "UNKNOWN",
+            "volatility": 0.0
         }
 
-    imbalances = []
-    confirming = 0
+    returns = []
 
-    for name in names:
+    for i in range(
+        1,
+        len(prices)
+    ):
+        if prices[i - 1] != 0:
+            returns.append(
+                (
+                    prices[i]
+                    - prices[i - 1]
+                )
+                / prices[i - 1]
+                * 100
+            )
 
-        series = []
-
-        for snapshot in snapshots:
-
-            item = snapshot[
-                "heavyweights"
-            ].get(name)
-
-            if item:
-                series.append(item)
-
-        if not series:
-            continue
-
-        first = series[0]
-        last = series[-1]
-
-        imbalance = last["imbalance"]
-
-        price_move = pct_change(
-            first["ltp"],
-            last["ltp"],
-        )
-
-        score = (
-            0.60 * imbalance
-            + 0.40 * clamp(
-                price_move / 0.30
+    if returns:
+        volatility = math.sqrt(
+            mean(
+                [
+                    x * x
+                    for x in returns
+                ]
             )
         )
+    else:
+        volatility = 0.0
 
-        imbalances.append(score)
+    range_pct = (
+        pct_change(
+            wf["low"],
+            wf["high"]
+        )
+        if wf["low"] > 0
+        else 0
+    )
 
-        if abs(score) >= 0.15:
-            confirming += 1
+    if volatility > 0.12:
+        regime = "HIGH_VOLATILITY"
+    elif abs(wf["return_pct"]) > 0.35:
+        regime = "TREND"
+    elif range_pct < 0.25:
+        regime = "RANGE"
+    else:
+        regime = "NORMAL"
 
     return {
-        "average_imbalance": mean(
-            imbalances
-        ),
-        "confirming": confirming,
-        "total": len(imbalances),
+        "regime": regime,
+        "volatility": volatility
     }
 
 
-def structure_features(
-    snapshots,
-    label,
-):
-    values = [
-        s["indices"][label]["ltp"]
-        for s in snapshots
-        if label in s["indices"]
-    ]
+# ============================================================
+# EXPIRY PRIORITY
+# ============================================================
 
-    if not values:
-        return {
-            "return": 0,
-            "high": 0,
-            "low": 0,
-            "range": 0,
+def is_expiry_day(expiry):
+    expiry_date = parse_expiry_date(
+        expiry
+    )
+
+    if not expiry_date:
+        return False
+
+    return (
+        expiry_date
+        == now_ist().date()
+    )
+
+
+def determine_priority(
+    nifty_expiry,
+    sensex_expiry
+):
+    nifty_expiry_day = is_expiry_day(
+        nifty_expiry
+    )
+
+    sensex_expiry_day = is_expiry_day(
+        sensex_expiry
+    )
+
+    if nifty_expiry_day:
+        return "NIFTY"
+
+    if sensex_expiry_day:
+        return "SENSEX"
+
+    return "NIFTY"
+
+
+# ============================================================
+# FEATURE ENGINE
+# ============================================================
+
+def build_features(
+    snapshots,
+    baseline
+):
+    latest = latest_snapshot(
+        snapshots
+    )
+
+    if not latest or not baseline:
+        raise RuntimeError(
+            "Insufficient snapshots"
+        )
+
+    # Use all samples from collection.
+    option_features = option_flow_features(
+        snapshots[0],
+        latest
+    )
+
+    idx_features = index_features(
+        snapshots[0],
+        latest
+    )
+
+    hw_features = heavyweight_features(
+        snapshots[0],
+        latest
+    )
+
+    window = {
+        "NIFTY":
+            window_features(
+                snapshots,
+                "NIFTY"
+            ),
+        "SENSEX":
+            window_features(
+                snapshots,
+                "SENSEX"
+            )
+    }
+
+    regime = {
+        "NIFTY":
+            detect_regime(
+                snapshots,
+                "NIFTY"
+            ),
+        "SENSEX":
+            detect_regime(
+                snapshots,
+                "SENSEX"
+            )
+    }
+
+    baseline_features = {}
+
+    for label in (
+        "NIFTY",
+        "SENSEX"
+    ):
+
+        base = baseline[
+            "indices"
+        ].get(label, {})
+
+        current = latest[
+            "indices"
+        ].get(label, {})
+
+        baseline_features[label] = {
+            "baseline_price":
+                base.get(
+                    "ltp",
+                    0
+                ),
+            "latest_price":
+                current.get(
+                    "ltp",
+                    0
+                ),
+            "baseline_to_latest":
+                pct_change(
+                    base.get(
+                        "ltp",
+                        0
+                    ),
+                    current.get(
+                        "ltp",
+                        0
+                    )
+                )
         }
 
     return {
-        "return": pct_change(
-            values[0],
-            values[-1],
-        ),
-        "high": max(values),
-        "low": min(values),
-        "range": (
-            max(values) - min(values)
-        ),
+        "options":
+            option_features,
+        "indices":
+            idx_features,
+        "heavyweights":
+            hw_features,
+        "window":
+            window,
+        "regime":
+            regime,
+        "baseline":
+            baseline_features,
+        "sample_count":
+            len(snapshots),
+        "generated_at":
+            timestamp()
     }
 
 
 # ============================================================
-# QUANTITATIVE SIGNAL
+# CALIBRATION
 # ============================================================
 
-FEATURE_NAMES = [
-    "option_flow",
-    "option_acceleration",
-    "index_return",
-    "index_imbalance",
-    "imbalance_change",
-    "heavyweight_confirmation",
-]
-
-
 DEFAULT_WEIGHTS = {
-    "option_flow": 0.26,
-    "option_acceleration": 0.12,
-    "index_return": 0.18,
-    "index_imbalance": 0.18,
-    "imbalance_change": 0.10,
-    "heavyweight_confirmation": 0.16,
+    "option_volume": 0.24,
+    "option_premium": 0.15,
+    "option_oi": 0.12,
+    "option_imbalance": 0.08,
+    "index_return": 0.14,
+    "index_imbalance": 0.10,
+    "heavyweights": 0.12,
+    "momentum": 0.05
 }
 
 
-def feature_vector(
-    option_data,
-    index_data,
-    heavyweight_data,
-):
-
-    return {
-        "option_flow": clamp(
-            option_data["flow_score"]
-        ),
-
-        "option_acceleration": clamp(
-            (
-                option_data["pe_acceleration"]
-                -
-                option_data["ce_acceleration"]
-            )
-            /
-            max(
-                1.0,
-                abs(
-                    option_data[
-                        "pe_acceleration"
-                    ]
-                )
-                +
-                abs(
-                    option_data[
-                        "ce_acceleration"
-                    ]
-                ),
-            )
-        ),
-
-        "index_return": clamp(
-            index_data["return"] / 0.35
-        ),
-
-        "index_imbalance": clamp(
-            index_data["imbalance"]
-        ),
-
-        "imbalance_change": clamp(
-            index_data["imbalance_change"]
-            * 3
-        ),
-
-        "heavyweight_confirmation": clamp(
-            heavyweight_data[
-                "average_imbalance"
-            ]
-        ),
-    }
-
-
-def weighted_score(
-    features,
-    weights,
-):
-    score = 0.0
-
-    for name in FEATURE_NAMES:
-        score += (
-            features[name]
-            * weights.get(
-                name,
-                DEFAULT_WEIGHTS[name],
-            )
-        )
-
-    return clamp(score)
-
-
-# ============================================================
-# WALK-FORWARD CALIBRATION
-# ============================================================
-
-def ensure_data_dir():
-    os.makedirs(
-        DATA_DIR,
-        exist_ok=True,
-    )
-
-
-def load_history():
+def load_calibration():
     ensure_data_dir()
 
     if not os.path.exists(
@@ -1155,231 +1789,626 @@ def load_history():
     ):
         return []
 
-    records = []
+    rows = []
 
-    with open(
-        CALIBRATION_FILE,
-        "r",
-        encoding="utf-8",
-    ) as f:
+    try:
+        with open(
+            CALIBRATION_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
 
-        for line in f:
+            for line in file:
 
-            try:
-                records.append(
-                    json.loads(line)
-                )
-            except Exception:
-                pass
+                line = line.strip()
 
-    return records
+                if not line:
+                    continue
+
+                try:
+                    rows.append(
+                        json.loads(line)
+                    )
+                except Exception:
+                    continue
+
+    except Exception as exc:
+        print(
+            "Calibration read error:",
+            exc
+        )
+
+    return rows
 
 
-def save_record(record):
+def save_calibration(record):
     ensure_data_dir()
 
     with open(
         CALIBRATION_FILE,
         "a",
-        encoding="utf-8",
-    ) as f:
+        encoding="utf-8"
+    ) as file:
 
-        f.write(
+        file.write(
             json.dumps(
                 record,
-                separators=(",", ":"),
+                separators=(
+                    ",",
+                    ":"
+                ),
+                default=str
             )
             + "\n"
         )
 
 
-def calibrated_weights(history):
+def historical_direction_accuracy(
+    rows
+):
+    usable = [
+        x for x in rows
+        if x.get("correct") is not None
+    ]
 
-    if len(history) < 25:
-        return DEFAULT_WEIGHTS.copy()
+    if not usable:
+        return None
 
-    weights = DEFAULT_WEIGHTS.copy()
+    correct = sum(
+        1 for x in usable
+        if x["correct"]
+    )
 
-    # Simple bounded walk-forward adjustment.
-    # We deliberately require a meaningful sample
-    # before changing the weights.
+    return (
+        correct
+        / len(usable)
+    )
 
-    for name in FEATURE_NAMES:
 
-        correct_positive = 0
-        correct_negative = 0
-        total = 0
+def calibrated_weights():
+    """
+    Walk-forward calibration.
 
-        for record in history[-150:]:
+    Important:
+    We do NOT allow the calibration system to
+    completely rewrite the model after a few trades.
 
-            outcome = record.get(
-                "outcome"
-            )
+    Minimum sample:
+        25 evaluated sessions.
 
-            features = record.get(
-                "features",
-                {},
-            )
+    Adjustments are bounded.
+    """
 
-            if outcome not in (
-                "BULLISH",
-                "BEARISH",
-            ):
-                continue
+    rows = load_calibration()
+
+    usable = [
+        x for x in rows
+        if x.get("features")
+        and x.get("correct") is not None
+    ]
+
+    if len(usable) < MIN_CALIBRATION_SAMPLES:
+        return dict(
+            DEFAULT_WEIGHTS
+        )
+
+    weights = dict(
+        DEFAULT_WEIGHTS
+    )
+
+    # Recent sample gets slightly more importance.
+    recent = usable[-100:]
+
+    scores = {
+        key: []
+        for key in weights
+    }
+
+    for row in recent:
+
+        features = row.get(
+            "features",
+            {}
+        )
+
+        outcome = row.get(
+            "outcome_direction"
+        )
+
+        if outcome not in (
+            "BULLISH",
+            "BEARISH"
+        ):
+            continue
+
+        target = (
+            1
+            if outcome == "BULLISH"
+            else -1
+        )
+
+        for key in scores:
 
             value = safe_float(
-                features.get(name)
+                features.get(
+                    key,
+                    0
+                )
             )
 
-            if value == 0:
-                continue
-
-            predicted_positive = (
-                value > 0
+            scores[key].append(
+                value * target
             )
 
-            actual_positive = (
-                outcome == "BULLISH"
-            )
+    for key, values in scores.items():
 
-            if predicted_positive == actual_positive:
-                correct_positive += 1
+        if not values:
+            continue
 
-            correct_negative += 0
-            total += 1
+        edge = mean(values)
 
-        if total >= 20:
+        # Small, bounded adjustment.
+        adjustment = clamp(
+            edge * 0.15,
+            -0.035,
+            0.035
+        )
 
-            accuracy = (
-                correct_positive
-                / total
-            )
+        weights[key] = clamp(
+            weights[key]
+            + adjustment,
+            0.03,
+            0.35
+        )
 
-            multiplier = (
-                0.75
-                +
-                0.60 * accuracy
-            )
-
-            weights[name] = (
-                DEFAULT_WEIGHTS[name]
-                * multiplier
-            )
-
-    total_weight = sum(
+    total = sum(
         weights.values()
     )
 
-    if total_weight <= 0:
-        return DEFAULT_WEIGHTS.copy()
+    if total <= 0:
+        return dict(
+            DEFAULT_WEIGHTS
+        )
+
+    for key in weights:
+        weights[key] /= total
+
+    return weights
+
+
+# ============================================================
+# SIGNAL SCORING
+# ============================================================
+
+def score_index(
+    label,
+    features,
+    weights
+):
+    options = features[
+        "options"
+    ][label]
+
+    index = features[
+        "indices"
+    ][label]
+
+    window = features[
+        "window"
+    ][label]
+
+    hw = features[
+        "heavyweights"
+    ]
+
+    # -------------------------
+    # Option volume
+    # -------------------------
+    option_volume = clamp(
+        options[
+            "volume_balance"
+        ]
+    )
+
+    # -------------------------
+    # Premium movement
+    # CE rising vs PE rising
+    # -------------------------
+    option_premium = clamp(
+        options[
+            "premium_balance"
+        ]
+    )
+
+    # -------------------------
+    # OI
+    # -------------------------
+    option_oi = clamp(
+        options[
+            "oi_balance"
+        ]
+    )
+
+    # -------------------------
+    # Option bid/ask
+    # -------------------------
+    option_imbalance = clamp(
+        options[
+            "bid_ask_balance"
+        ]
+    )
+
+    # -------------------------
+    # Index price
+    # -------------------------
+    index_return = clamp(
+        index[
+            "return_pct"
+        ] / 0.40
+    )
+
+    # -------------------------
+    # Index bid/ask
+    # -------------------------
+    index_imbalance = clamp(
+        index[
+            "imbalance"
+        ]
+    )
+
+    # -------------------------
+    # Heavyweight confirmation
+    # -------------------------
+    heavyweight_score = clamp(
+        hw[
+            "average_score"
+        ]
+    )
+
+    # -------------------------
+    # Momentum
+    # -------------------------
+    momentum = clamp(
+        window[
+            "momentum"
+        ] / 0.20
+    )
+
+    components = {
+        "option_volume":
+            option_volume,
+        "option_premium":
+            option_premium,
+        "option_oi":
+            option_oi,
+        "option_imbalance":
+            option_imbalance,
+        "index_return":
+            index_return,
+        "index_imbalance":
+            index_imbalance,
+        "heavyweights":
+            heavyweight_score,
+        "momentum":
+            momentum
+    }
+
+    score = sum(
+        components[key]
+        * weights[key]
+        for key in components
+    )
+
+    # VWAP structure.
+    vwap = window[
+        "vwap"
+    ]
+
+    last_price = window[
+        "last_price"
+    ]
+
+    if vwap > 0 and last_price > 0:
+
+        vwap_signal = clamp(
+            (
+                last_price
+                - vwap
+            )
+            / (
+                vwap
+                * 0.0015
+            )
+        )
+
+        score += (
+            vwap_signal
+            * 0.06
+        )
+
+    score = clamp(
+        score
+    )
 
     return {
-        k: v / total_weight
-        for k, v in weights.items()
+        "score":
+            score,
+        "components":
+            components
     }
 
 
+def direction_from_score(
+    score
+):
+    if score >= SIGNAL_THRESHOLD:
+        return "BULLISH"
+
+    if score <= -SIGNAL_THRESHOLD:
+        return "BEARISH"
+
+    return "NO CLEAR SIGNAL"
+
+
+def confidence_from_score(
+    score,
+    sample_count
+):
+    absolute = abs(
+        score
+    )
+
+    # Confidence is intentionally capped.
+    # More data increases reliability,
+    # but never creates artificial certainty.
+    base = (
+        absolute
+        * 100
+    )
+
+    if sample_count < 5:
+        base *= 0.75
+
+    return int(
+        max(
+            50,
+            min(
+                95,
+                base
+            )
+        )
+    )
+
+
 # ============================================================
-# OPTIONAL AI LAYER
+# AI LAYER
 # ============================================================
 
-def ai_assessment(
+def ai_classification(
     features,
-    quant_score,
-    priority,
-    confidence,
+    preliminary
 ):
+    """
+    Optional AI confirmation.
+
+    AI does NOT get to rewrite quantitative
+    features or weights.
+
+    It only classifies the existing evidence.
+    """
 
     if not OPENAI_API_KEY:
         return {
-            "direction": (
-                "BULLISH"
-                if quant_score > 0
-                else "BEARISH"
-                if quant_score < 0
-                else "NO SIGNAL"
-            ),
-            "confidence": confidence,
-            "available": False,
-            "reason": "AI disabled",
+            "enabled": False,
+            "direction":
+                preliminary[
+                    "direction"
+                ],
+            "confidence":
+                preliminary[
+                    "confidence"
+                ],
+            "reason":
+                "AI disabled"
         }
 
-    prompt = {
-        "task": "CAS market classification",
-        "instruction": (
-            "Classify the 3:17 PM CAS direction. "
-            "Use only the supplied quantitative data. "
-            "Do not invent data. "
-            "If evidence conflicts, return NO SIGNAL."
-        ),
-        "priority": priority,
-        "quant_score": quant_score,
-        "quant_confidence": confidence,
-        "features": features,
-        "allowed": [
-            "BULLISH",
-            "BEARISH",
-            "NO SIGNAL",
-        ],
+    payload_features = {
+        "nifty": {
+            "score":
+                preliminary[
+                    "nifty_score"
+                ],
+            "options":
+                features[
+                    "options"
+                ]["NIFTY"],
+            "index":
+                features[
+                    "indices"
+                ]["NIFTY"],
+            "regime":
+                features[
+                    "regime"
+                ]["NIFTY"]
+        },
+        "sensex": {
+            "score":
+                preliminary[
+                    "sensex_score"
+                ],
+            "options":
+                features[
+                    "options"
+                ]["SENSEX"],
+            "index":
+                features[
+                    "indices"
+                ]["SENSEX"],
+            "regime":
+                features[
+                    "regime"
+                ]["SENSEX"]
+        }
     }
 
-    try:
+    prompt = f"""
+You are a market-signal validation layer.
 
+Do not invent data.
+Do not place trades.
+Do not change quantitative weights.
+
+Review these already-calculated CAS features.
+
+Return JSON only:
+
+{{
+  "direction": "BULLISH|BEARISH|NO CLEAR SIGNAL",
+  "confidence": 0-100,
+  "reason": "short explanation"
+}}
+
+If evidence conflicts, choose NO CLEAR SIGNAL.
+
+DATA:
+{json.dumps(payload_features, default=str)}
+"""
+
+    try:
         response = requests.post(
             "https://api.openai.com/v1/responses",
             headers={
                 "Authorization":
                     f"Bearer {OPENAI_API_KEY}",
                 "Content-Type":
-                    "application/json",
+                    "application/json"
             },
             json={
-                "model": os.environ.get(
-                    "OPENAI_MODEL",
-                    "gpt-5.6-luna",
-                ),
-                "input": json.dumps(
+                "model":
+                    OPENAI_MODEL,
+                "input":
                     prompt
-                ),
             },
-            timeout=30,
+            timeout=30
         )
 
         response.raise_for_status()
 
         data = response.json()
 
-        text = data.get(
-            "output_text",
-            "",
-        ).strip().upper()
+        text = ""
 
-        if "BULLISH" in text:
-            direction = "BULLISH"
-        elif "BEARISH" in text:
-            direction = "BEARISH"
-        else:
-            direction = "NO SIGNAL"
+        if isinstance(
+            data.get("output_text"),
+            str
+        ):
+            text = data[
+                "output_text"
+            ]
+
+        if not text:
+            # Fallback parser.
+            output = data.get(
+                "output",
+                []
+            )
+
+            for item in output:
+                for content in item.get(
+                    "content",
+                    []
+                ):
+                    if (
+                        content.get(
+                            "type"
+                        )
+                        == "output_text"
+                    ):
+                        text += content.get(
+                            "text",
+                            ""
+                        )
+
+        text = text.strip()
+
+        # Remove accidental markdown fences.
+        text = (
+            text.replace(
+                "```json",
+                ""
+            )
+            .replace(
+                "```",
+                ""
+            )
+            .strip()
+        )
+
+        parsed = json.loads(
+            text
+        )
+
+        direction = parsed.get(
+            "direction",
+            "NO CLEAR SIGNAL"
+        )
+
+        confidence = safe_int(
+            parsed.get(
+                "confidence",
+                50
+            ),
+            50
+        )
+
+        if direction not in (
+            "BULLISH",
+            "BEARISH",
+            "NO CLEAR SIGNAL"
+        ):
+            direction = (
+                "NO CLEAR SIGNAL"
+            )
 
         return {
-            "direction": direction,
-            "confidence": confidence,
-            "available": True,
-            "reason": text[:300],
+            "enabled": True,
+            "direction":
+                direction,
+            "confidence":
+                max(
+                    0,
+                    min(
+                        100,
+                        confidence
+                    )
+                ),
+            "reason":
+                str(
+                    parsed.get(
+                        "reason",
+                        ""
+                    )
+                )[:500]
         }
 
     except Exception as exc:
-
         print(
-            "AI unavailable:",
-            exc,
+            "AI layer error:",
+            exc
         )
 
         return {
-            "direction": "NO SIGNAL",
-            "confidence": confidence,
-            "available": False,
-            "reason": "AI request failed",
+            "enabled": True,
+            "direction":
+                preliminary[
+                    "direction"
+                ],
+            "confidence":
+                preliminary[
+                    "confidence"
+                ],
+            "reason":
+                "AI unavailable"
         }
 
 
@@ -1387,210 +2416,531 @@ def ai_assessment(
 # FINAL SIGNAL
 # ============================================================
 
-def classify(
-    score,
-    ai_direction,
-    priority,
+def generate_signal(
+    features,
+    priority
 ):
+    weights = calibrated_weights()
 
-    # Quantitative score remains authoritative.
-    # AI acts as confirmation.
-
-    if abs(score) < 0.18:
-        return "NO SIGNAL"
-
-    quant_direction = (
-        "BULLISH"
-        if score > 0
-        else "BEARISH"
+    nifty = score_index(
+        "NIFTY",
+        features,
+        weights
     )
 
-    if ai_direction == "NO SIGNAL":
-        return "NO SIGNAL"
+    sensex = score_index(
+        "SENSEX",
+        features,
+        weights
+    )
 
-    # Require AI agreement for stronger signals.
-    if ai_direction != quant_direction:
-        if abs(score) < 0.42:
-            return "NO SIGNAL"
-
-        return quant_direction
-
-    return quant_direction
-
-
-def confidence_from_score(
-    score,
-    historical_count,
-):
-
-    base = 50 + (
-        min(
-            40,
-            abs(score) * 45,
+    nifty_direction = (
+        direction_from_score(
+            nifty["score"]
         )
     )
 
-    if historical_count < 25:
-        base -= 5
-
-    return int(
-        max(
-            50,
-            min(
-                90,
-                base,
-            ),
+    sensex_direction = (
+        direction_from_score(
+            sensex["score"]
         )
     )
+
+    # Priority gets a modest additional weight,
+    # not an arbitrary override.
+    if priority == "NIFTY":
+        final_score = (
+            nifty["score"] * 0.65
+            + sensex["score"] * 0.35
+        )
+    else:
+        final_score = (
+            nifty["score"] * 0.35
+            + sensex["score"] * 0.65
+        )
+
+    direction = (
+        direction_from_score(
+            final_score
+        )
+    )
+
+    confidence = (
+        confidence_from_score(
+            final_score,
+            features[
+                "sample_count"
+            ]
+        )
+    )
+
+    preliminary = {
+        "direction":
+            direction,
+        "confidence":
+            confidence,
+        "nifty_score":
+            nifty["score"],
+        "sensex_score":
+            sensex["score"]
+    }
+
+    ai = ai_classification(
+        features,
+        preliminary
+    )
+
+    # AI can veto a weak/conflicted signal,
+    # but it cannot turn a strong quantitative
+    # signal into an opposite trade direction.
+    if ai["enabled"]:
+
+        if (
+            direction
+            == "NO CLEAR SIGNAL"
+        ):
+            final_direction = (
+                "NO CLEAR SIGNAL"
+            )
+
+        elif (
+            ai["direction"]
+            == "NO CLEAR SIGNAL"
+        ):
+            final_direction = (
+                "NO CLEAR SIGNAL"
+            )
+
+        elif (
+            ai["direction"]
+            == direction
+        ):
+            final_direction = direction
+
+        else:
+            # Quant + AI disagreement.
+            final_direction = (
+                "NO CLEAR SIGNAL"
+            )
+
+        final_confidence = min(
+            confidence,
+            ai["confidence"]
+        )
+
+        if (
+            final_direction
+            == "NO CLEAR SIGNAL"
+        ):
+            final_confidence = min(
+                final_confidence,
+                60
+            )
+
+    else:
+        final_direction = direction
+        final_confidence = confidence
+
+    return {
+        "priority":
+            priority,
+        "direction":
+            final_direction,
+        "confidence":
+            final_confidence,
+        "nifty_direction":
+            nifty_direction,
+        "nifty_score":
+            nifty["score"],
+        "sensex_direction":
+            sensex_direction,
+        "sensex_score":
+            sensex["score"],
+        "weights":
+            weights,
+        "ai":
+            ai
+    }
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send_telegram(message):
-
+def telegram_send(message):
     url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}"
+        "/sendMessage"
     )
 
     response = requests.post(
         url,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
+        json={
+            "chat_id":
+                TELEGRAM_CHAT_ID,
+            "text":
+                message
         },
-        timeout=20,
+        timeout=20
     )
 
     if response.status_code >= 400:
         raise RuntimeError(
-            f"Telegram failed: "
-            f"{response.text}"
+            "Telegram error: "
+            + response.text[:1000]
         )
 
 
-# ============================================================
-# FORMAT SIGNAL
-# ============================================================
-
-def arrow(direction):
-
+def emoji_for_direction(
+    direction
+):
     if direction == "BULLISH":
-        return "🟢 BULLISH"
+        return "🟢"
 
     if direction == "BEARISH":
-        return "🔴 BEARISH"
+        return "🔴"
 
-    return "🟡 NO CLEAR SIGNAL"
+    return "🟡"
 
 
-def format_signal(
-    results,
-    priority,
-    final_direction,
-    final_confidence,
+# ============================================================
+# TELEGRAM MESSAGE
+# ============================================================
+
+def format_signal_message(
+    signal,
+    features,
+    expiry_info
 ):
-
-    lines = [
-        "🚨 CAS SIGNAL | 3:17 PM",
-        "",
+    priority = signal[
+        "priority"
     ]
 
-    for label in ("NIFTY", "SENSEX"):
+    direction = signal[
+        "direction"
+    ]
 
-        if label not in results:
-            continue
+    confidence = signal[
+        "confidence"
+    ]
 
-        r = results[label]
+    nifty_opt = features[
+        "options"
+    ]["NIFTY"]
 
-        lines.append(
-            f"📊 {label}: "
-            f"{arrow(r['direction'])}"
+    sensex_opt = features[
+        "options"
+    ]["SENSEX"]
+
+    nifty_idx = features[
+        "indices"
+    ]["NIFTY"]
+
+    sensex_idx = features[
+        "indices"
+    ]["SENSEX"]
+
+    hw = features[
+        "heavyweights"
+    ]
+
+    nifty_emoji = emoji_for_direction(
+        signal[
+            "nifty_direction"
+        ]
+    )
+
+    sensex_emoji = emoji_for_direction(
+        signal[
+            "sensex_direction"
+        ]
+    )
+
+    final_emoji = emoji_for_direction(
+        direction
+    )
+
+    ai = signal[
+        "ai"
+    ]
+
+    if ai["enabled"]:
+        ai_text = (
+            f'AI: {ai["direction"]} '
+            f'({ai["confidence"]}%)'
         )
+    else:
+        ai_text = "AI: OFF"
 
-        lines.append(
-            f"ATM: {r['atm']} | "
-            f"Expiry: {r['expiry']}"
+    nifty_flow = (
+        "CE"
+        if nifty_opt[
+            "volume_balance"
+        ] > 0.10
+        else (
+            "PE"
+            if nifty_opt[
+                "volume_balance"
+            ] < -0.10
+            else "MIXED"
         )
+    )
 
-        lines.append(
-            f"CE/PE Volume Ratio: "
-            f"{r['ce_pe_ratio']:.2f}"
+    sensex_flow = (
+        "CE"
+        if sensex_opt[
+            "volume_balance"
+        ] > 0.10
+        else (
+            "PE"
+            if sensex_opt[
+                "volume_balance"
+            ] < -0.10
+            else "MIXED"
         )
+    )
 
-        lines.append(
-            f"Option Flow: "
-            f"{r['option_flow']:+.2f}"
-        )
+    x_post = (
+        f"{final_emoji} CAS SIGNAL | 3:17 PM\n"
+        f"{priority} PRIORITY | "
+        f"{direction} | "
+        f"{confidence}% confidence\n\n"
+        f"NIFTY: "
+        f"{nifty_emoji} "
+        f"{signal['nifty_direction']} "
+        f"({signal['nifty_score']:.2f})\n"
+        f"ATM±1 Flow: {nifty_flow}\n"
+        f"Index: "
+        f"{nifty_idx['return_pct']:+.2f}%\n\n"
+        f"SENSEX: "
+        f"{sensex_emoji} "
+        f"{signal['sensex_direction']} "
+        f"({signal['sensex_score']:.2f})\n"
+        f"ATM±1 Flow: {sensex_flow}\n"
+        f"Index: "
+        f"{sensex_idx['return_pct']:+.2f}%\n\n"
+        f"Heavyweights: "
+        f"{hw['positive']} bullish / "
+        f"{hw['negative']} bearish\n"
+        f"{ai_text}\n\n"
+        f"#Nifty #Sensex #CAS "
+        f"#OptionsTrading #OrderFlow "
+        f"#IndianStockMarket"
+    )
 
-        lines.append(
-            f"Bid/Ask Imbalance: "
-            f"{r['imbalance']:+.2f}"
-        )
-
-        lines.append(
-            f"Spot Return: "
-            f"{r['spot_return']:+.2f}%"
-        )
-
-        lines.append(
-            f"Heavyweight Confirmation: "
-            f"{r['heavyweight_confirming']}/"
-            f"{r['heavyweight_total']}"
-        )
-
-        lines.append("")
-
-    lines.extend([
-        f"🔥 Priority: {priority}",
-        "",
-        f"🎯 CAS Bias: "
-        f"{arrow(final_direction)}",
-        f"Confidence: {final_confidence}%",
-        "",
-        "#Nifty #Sensex #CAS "
-        "#OptionsTrading #OrderFlow "
-        "#IndianStockMarket",
-    ])
-
-    return "\n".join(lines)
+    return x_post
 
 
 # ============================================================
-# COLLECTION
+# OUTCOME
 # ============================================================
 
-def collect_window(
+def calculate_outcome(
+    baseline,
+    outcome_snapshot,
+    priority
+):
+    result = {}
+
+    for label in (
+        "NIFTY",
+        "SENSEX"
+    ):
+
+        base = baseline[
+            "indices"
+        ].get(label, {})
+
+        outcome = outcome_snapshot[
+            "indices"
+        ].get(label, {})
+
+        base_price = base.get(
+            "ltp",
+            0
+        )
+
+        outcome_price = outcome.get(
+            "ltp",
+            0
+        )
+
+        move = pct_change(
+            base_price,
+            outcome_price
+        )
+
+        if move > OUTCOME_THRESHOLD_PCT:
+            direction = "BULLISH"
+        elif move < -OUTCOME_THRESHOLD_PCT:
+            direction = "BEARISH"
+        else:
+            direction = "MIXED"
+
+        result[label] = {
+            "baseline":
+                base_price,
+            "outcome":
+                outcome_price,
+            "move_pct":
+                move,
+            "direction":
+                direction
+        }
+
+    priority_outcome = result[
+        priority
+    ]
+
+    return {
+        "indices":
+            result,
+        "priority":
+            priority,
+        "direction":
+            priority_outcome[
+                "direction"
+            ],
+        "move_pct":
+            priority_outcome[
+                "move_pct"
+            ]
+    }
+
+
+def evaluate_prediction(
+    prediction,
+    outcome
+):
+    predicted = prediction[
+        "direction"
+    ]
+
+    actual = outcome[
+        "direction"
+    ]
+
+    if predicted == "NO CLEAR SIGNAL":
+        return {
+            "correct":
+                None,
+            "evaluation":
+                "NO_SIGNAL"
+        }
+
+    if actual == "MIXED":
+        return {
+            "correct":
+                None,
+            "evaluation":
+                "MIXED"
+        }
+
+    return {
+        "correct":
+            predicted == actual,
+        "evaluation":
+            (
+                "CORRECT"
+                if predicted == actual
+                else "WRONG"
+            )
+    }
+
+
+# ============================================================
+# OUTCOME TELEGRAM
+# ============================================================
+
+def format_outcome_message(
+    prediction,
+    outcome,
+    evaluation
+):
+    direction = prediction[
+        "direction"
+    ]
+
+    actual = outcome[
+        "direction"
+    ]
+
+    emoji = (
+        "✅"
+        if evaluation[
+            "evaluation"
+        ] == "CORRECT"
+        else (
+            "❌"
+            if evaluation[
+                "evaluation"
+            ] == "WRONG"
+            else "⚪"
+        )
+    )
+
+    move = outcome[
+        "move_pct"
+    ]
+
+    return (
+        f"{emoji} CAS OUTCOME | 3:30 PM\n\n"
+        f"Prediction: "
+        f"{direction}\n"
+        f"Actual: "
+        f"{actual}\n"
+        f"Move: "
+        f"{move:+.2f}%\n"
+        f"Result: "
+        f"{evaluation['evaluation']}\n\n"
+        f"Baseline: 3:15 PM\n"
+        f"Outcome: 3:30 PM\n\n"
+        f"#Nifty #Sensex #CAS "
+        f"#Trading #Calibration"
+    )
+
+
+# ============================================================
+# MAIN COLLECTION
+# ============================================================
+
+def collect_session(
     dhan,
     index_instruments,
     option_contracts,
-    heavyweight_instruments,
+    heavyweight_instruments
 ):
+    today = now_ist().date()
 
-    start = now_ist().replace(
-        hour=15,
-        minute=0,
-        second=0,
-        microsecond=0,
+    start = datetime(
+        today.year,
+        today.month,
+        today.day,
+        COLLECTION_START[0],
+        COLLECTION_START[1],
+        tzinfo=IST
     )
 
-    end = now_ist().replace(
-        hour=15,
-        minute=17,
-        second=0,
-        microsecond=0,
+    prediction_time = datetime(
+        today.year,
+        today.month,
+        today.day,
+        PREDICTION_TIME[0],
+        PREDICTION_TIME[1],
+        tzinfo=IST
     )
 
-    sleep_until(start)
+    if now_ist() < start:
+        sleep_until(
+            start
+        )
 
     snapshots = []
 
-    while now_ist() < end:
+    while now_ist() < prediction_time:
 
         try:
-
             instruments = (
                 index_instruments
                 + option_contracts
@@ -1599,237 +2949,112 @@ def collect_window(
 
             quote = get_quote(
                 dhan,
-                instruments,
+                instruments
             )
 
             snapshot = make_snapshot(
                 quote,
                 index_instruments,
                 option_contracts,
-                heavyweight_instruments,
+                heavyweight_instruments
             )
 
-            snapshots.append(snapshot)
+            snapshots.append(
+                snapshot
+            )
 
             print(
-                "Collected:",
-                snapshot["timestamp"],
+                "Snapshot:",
+                snapshot[
+                    "timestamp"
+                ],
+                "count:",
+                len(snapshots)
             )
 
         except Exception as exc:
-
             print(
-                "Collection error:",
-                exc,
+                "Snapshot error:",
+                exc
             )
 
-        time.sleep(1.05)
+        remaining = (
+            prediction_time
+            - now_ist()
+        ).total_seconds()
+
+        if remaining <= 0:
+            break
+
+        time.sleep(
+            min(
+                SNAPSHOT_SECONDS,
+                max(
+                    1,
+                    remaining
+                )
+            )
+        )
 
     return snapshots
 
 
 # ============================================================
-# PROCESS ONE INDEX
+# 3:30 OUTCOME COLLECTION
 # ============================================================
 
-def process_index(
-    label,
-    snapshots,
-    contract_info,
-    history,
-):
-
-    option_data = option_features(
-        snapshots,
-        label,
-    )
-
-    index_data = index_features(
-        snapshots,
-        label,
-    )
-
-    hw_data = heavyweight_features(
-        snapshots,
-    )
-
-    structure = structure_features(
-        snapshots,
-        label,
-    )
-
-    features = feature_vector(
-        option_data,
-        index_data,
-        hw_data,
-    )
-
-    weights = calibrated_weights(
-        history
-    )
-
-    score = weighted_score(
-        features,
-        weights,
-    )
-
-    confidence = confidence_from_score(
-        score,
-        len(history),
-    )
-
-    # AI confirmation.
-    priority = label
-
-    ai = ai_assessment(
-        features,
-        score,
-        priority,
-        confidence,
-    )
-
-    direction = classify(
-        score,
-        ai["direction"],
-        priority,
-    )
-
-    return {
-        "label": label,
-        "direction": direction,
-        "score": score,
-        "confidence": confidence,
-        "atm": contract_info["atm"],
-        "expiry": contract_info["expiry"],
-        "ce_pe_ratio": option_data[
-            "ce_pe_volume_ratio"
-        ],
-        "option_flow": option_data[
-            "flow_score"
-        ],
-        "imbalance": index_data[
-            "imbalance"
-        ],
-        "spot_return": index_data[
-            "return"
-        ],
-        "heavyweight_confirming":
-            hw_data["confirming"],
-        "heavyweight_total":
-            hw_data["total"],
-        "features": features,
-        "structure": structure,
-        "ai": ai,
-    }
-
-
-# ============================================================
-# 3:15 BASELINE
-# ============================================================
-
-def baseline_at_1515(
+def collect_outcome(
     dhan,
-    index_instruments,
+    index_instruments
 ):
+    today = now_ist().date()
 
-    target = now_ist().replace(
-        hour=15,
-        minute=15,
-        second=0,
-        microsecond=0,
+    target = datetime(
+        today.year,
+        today.month,
+        today.day,
+        OUTCOME_TIME[0],
+        OUTCOME_TIME[1],
+        tzinfo=IST
     )
 
-    sleep_until(target)
+    if now_ist() < target:
+        sleep_until(
+            target
+        )
 
     quote = get_quote(
         dhan,
-        index_instruments,
+        index_instruments
     )
 
-    baseline = {}
-
-    for instrument in index_instruments:
-
-        packet = quote.get(
-            instrument["security_id"],
-            {},
-        )
-
-        baseline[
-            instrument["label"]
-        ] = packet_ltp(packet)
-
-    return baseline
+    return make_snapshot(
+        quote,
+        index_instruments,
+        [],
+        []
+    )
 
 
 # ============================================================
-# 3:30 OUTCOME
+# SAVE COMPLETE SESSION
 # ============================================================
 
-def outcome_at_1530(
-    dhan,
-    index_instruments,
-    baseline,
-):
+def save_state(state):
+    ensure_data_dir()
 
-    target = now_ist().replace(
-        hour=15,
-        minute=30,
-        second=0,
-        microsecond=0,
-    )
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
 
-    sleep_until(target)
-
-    quote = get_quote(
-        dhan,
-        index_instruments,
-    )
-
-    outcomes = {}
-
-    for instrument in index_instruments:
-
-        label = instrument["label"]
-
-        packet = quote.get(
-            instrument["security_id"],
-            {},
+        json.dump(
+            state,
+            file,
+            indent=2,
+            default=str
         )
-
-        final_price = packet_ltp(
-            packet
-        )
-
-        base = baseline.get(
-            label,
-            0,
-        )
-
-        move = pct_change(
-            base,
-            final_price,
-        )
-
-        # Meaningful threshold:
-        # avoids treating tiny noise as direction.
-        if move > 0.05:
-            direction = "BULLISH"
-
-        elif move < -0.05:
-            direction = "BEARISH"
-
-        else:
-            direction = "NEUTRAL"
-
-        outcomes[label] = {
-            "baseline_1515": base,
-            "price_1530": final_price,
-            "move_pct": move,
-            "direction": direction,
-        }
-
-    return outcomes
 
 
 # ============================================================
@@ -1839,270 +3064,563 @@ def outcome_at_1530(
 def main():
 
     print(
-        "Starting CAS engine:",
-        now_ist().isoformat(),
+        "=" * 60
+    )
+
+    print(
+        "CAS ENGINE START"
+    )
+
+    print(
+        "Time:",
+        timestamp()
+    )
+
+    print(
+        "=" * 60
     )
 
     ensure_data_dir()
 
     dhan = Dhan()
 
+    # ----------------------------------------
+    # Build underlying instruments.
+    # ----------------------------------------
+
     index_instruments = [
         {
-            "label": "NIFTY",
-            "security_id": str(
-                NIFTY_ID
-            ),
-            "segment": INDEX_SEGMENT,
+            "label":
+                "NIFTY",
+            "security_id":
+                str(NIFTY_ID),
+            "segment":
+                INDEX_SEGMENT
         },
         {
-            "label": "SENSEX",
-            "security_id": str(
-                SENSEX_ID
-            ),
-            "segment": INDEX_SEGMENT,
-        },
+            "label":
+                "SENSEX",
+            "security_id":
+                str(SENSEX_ID),
+            "segment":
+                INDEX_SEGMENT
+        }
     ]
 
-    # Build ATM ±1 option universe before 3 PM.
-    print(
-        "Building option contracts..."
-    )
+    # ----------------------------------------
+    # Build ATM ±1 options.
+    # ----------------------------------------
 
-    nifty_contracts = build_atm_contracts(
+    nifty_options = build_atm_contracts(
         dhan,
         NIFTY_ID,
-        "NIFTY",
+        "NIFTY"
     )
 
-    time.sleep(3.2)
-
-    sensex_contracts = build_atm_contracts(
+    sensex_options = build_atm_contracts(
         dhan,
         SENSEX_ID,
-        "SENSEX",
+        "SENSEX"
     )
 
     option_contracts = (
-        nifty_contracts["contracts"]
-        +
-        sensex_contracts["contracts"]
-    )
-
-    heavyweight_instruments = (
-        build_heavyweight_instruments()
+        nifty_options["contracts"]
+        + sensex_options["contracts"]
     )
 
     print(
-        "Heavyweights:",
-        len(heavyweight_instruments),
+        "NIFTY ATM:",
+        nifty_options["atm"],
+        "Expiry:",
+        nifty_options["expiry"]
     )
 
-    # 3:00-3:17 collection.
-    snapshots = collect_window(
+    print(
+        "SENSEX ATM:",
+        sensex_options["atm"],
+        "Expiry:",
+        sensex_options["expiry"]
+    )
+
+    # ----------------------------------------
+    # Heavyweights.
+    # ----------------------------------------
+
+    heavyweight_instruments = (
+        build_heavyweights()
+    )
+
+    print(
+        "Heavyweights loaded:",
+        len(
+            heavyweight_instruments
+        )
+    )
+
+    # ----------------------------------------
+    # Priority.
+    # ----------------------------------------
+
+    priority = determine_priority(
+        nifty_options["expiry"],
+        sensex_options["expiry"]
+    )
+
+    print(
+        "Priority:",
+        priority
+    )
+
+    # ----------------------------------------
+    # 3:00 -> 3:17 collection.
+    # ----------------------------------------
+
+    snapshots = collect_session(
         dhan,
         index_instruments,
         option_contracts,
-        heavyweight_instruments,
+        heavyweight_instruments
     )
 
-    if len(snapshots) < 30:
+    if len(snapshots) < 3:
         raise RuntimeError(
-            "Too few market snapshots "
-            "were collected."
+            "Not enough market snapshots "
+            "to generate a reliable signal."
         )
 
-    print(
-        "Snapshots collected:",
-        len(snapshots),
-    )
+    # ----------------------------------------
+    # IMPORTANT:
+    # Exact 3:15 baseline.
+    #
+    # We DO NOT query the market here.
+    # We select the closest snapshot
+    # that was already captured during
+    # the 3:00-3:17 collection.
+    # ----------------------------------------
 
-    history = load_history()
-
-    # Determine expiry priority.
     today = now_ist().date()
 
-    nifty_expiry = datetime.strptime(
-        nifty_contracts["expiry"][:10],
-        "%Y-%m-%d",
-    ).date()
-
-    sensex_expiry = datetime.strptime(
-        sensex_contracts["expiry"][:10],
-        "%Y-%m-%d",
-    ).date()
-
-    if nifty_expiry == today:
-        priority = "NIFTY"
-
-    elif sensex_expiry == today:
-        priority = "SENSEX"
-
-    else:
-        priority = "NIFTY"
-
-    # Process both markets.
-    results = {}
-
-    results["NIFTY"] = process_index(
-        "NIFTY",
-        snapshots,
-        nifty_contracts,
-        history,
+    baseline_target = datetime(
+        today.year,
+        today.month,
+        today.day,
+        BASELINE_TIME[0],
+        BASELINE_TIME[1],
+        tzinfo=IST
     )
 
-    results["SENSEX"] = process_index(
-        "SENSEX",
+    baseline = closest_snapshot(
         snapshots,
-        sensex_contracts,
-        history,
+        baseline_target
     )
 
-    # Priority market gets greater authority.
-    p = results[priority]
+    baseline_age = abs(
+        (
+            snapshot_time(
+                baseline
+            )
+            - baseline_target
+        ).total_seconds()
+    )
 
-    if p["direction"] == "NO SIGNAL":
+    if baseline_age > 45:
+        raise RuntimeError(
+            "No reliable 3:15 PM baseline. "
+            f"Closest snapshot is "
+            f"{baseline_age:.0f}s away."
+        )
 
-        final_direction = "NO SIGNAL"
+    print(
+        "3:15 baseline:",
+        baseline["timestamp"],
+        f"({baseline_age:.1f}s away)"
+    )
 
-    else:
+    # ----------------------------------------
+    # Build features using ALL data through
+    # 3:17.
+    # ----------------------------------------
 
-        # Require meaningful score.
-        if abs(p["score"]) < 0.18:
-            final_direction = "NO SIGNAL"
-        else:
-            final_direction = p["direction"]
+    features = build_features(
+        snapshots,
+        baseline
+    )
 
-    final_confidence = p["confidence"]
+    # ----------------------------------------
+    # Generate signal.
+    # ----------------------------------------
 
-    # Save the 3:17 prediction data in memory.
-    prediction = {
-        "timestamp": now_ist().isoformat(),
-        "prediction_time": now_ist().isoformat(),
-        "priority": priority,
-        "direction": final_direction,
-        "confidence": final_confidence,
-        "features": p["features"],
-        "results": results,
+    signal = generate_signal(
+        features,
+        priority
+    )
+
+    print(
+        "NIFTY:",
+        signal["nifty_direction"],
+        signal["nifty_score"]
+    )
+
+    print(
+        "SENSEX:",
+        signal["sensex_direction"],
+        signal["sensex_score"]
+    )
+
+    print(
+        "FINAL:",
+        signal["direction"],
+        signal["confidence"]
+    )
+
+    # ----------------------------------------
+    # Telegram.
+    # ----------------------------------------
+
+    signal_message = format_signal_message(
+        signal,
+        features,
+        {
+            "nifty":
+                nifty_options["expiry"],
+            "sensex":
+                sensex_options["expiry"]
+        }
+    )
+
+    try:
+        telegram_send(
+            signal_message
+        )
+    except Exception as exc:
+        print(
+            "Telegram signal error:",
+            exc
+        )
+
+    # ----------------------------------------
+    # Save state so that the complete
+    # 3:17 prediction is preserved.
+    # ----------------------------------------
+
+    state = {
+        "date":
+            str(today),
+        "prediction_time":
+            timestamp(),
+        "baseline":
+            baseline,
+        "features":
+            features,
+        "prediction":
+            signal,
+        "priority":
+            priority,
+        "snapshots":
+            snapshots
     }
 
-    message = format_signal(
-        results,
-        priority,
-        final_direction,
-        final_confidence,
+    save_state(
+        state
     )
 
-    print(message)
+    # ----------------------------------------
+    # 3:17 -> 3:30.
+    # ----------------------------------------
 
-    send_telegram(message)
-
-    # --------------------------------------------------------
-    # 3:15 baseline
-    # --------------------------------------------------------
-
-    baseline = baseline_at_1515(
+    outcome_snapshot = collect_outcome(
         dhan,
-        index_instruments,
+        index_instruments
     )
 
-    # --------------------------------------------------------
-    # 3:30 evaluation
-    # --------------------------------------------------------
+    # ----------------------------------------
+    # 3:15 -> 3:30 outcome.
+    # ----------------------------------------
 
-    outcomes = outcome_at_1530(
-        dhan,
-        index_instruments,
+    outcome = calculate_outcome(
         baseline,
+        outcome_snapshot,
+        priority
     )
 
-    actual = outcomes.get(
-        priority,
-        {},
+    evaluation = evaluate_prediction(
+        signal,
+        outcome
     )
 
-    actual_direction = actual.get(
-        "direction",
-        "NEUTRAL",
+    print(
+        "OUTCOME:",
+        outcome
     )
 
-    if (
-        final_direction in (
-            "BULLISH",
-            "BEARISH",
-        )
-        and actual_direction in (
-            "BULLISH",
-            "BEARISH",
-        )
-    ):
+    print(
+        "EVALUATION:",
+        evaluation
+    )
 
-        correct = (
-            final_direction
-            == actual_direction
-        )
+    # ----------------------------------------
+    # Calibration record.
+    # ----------------------------------------
 
-    else:
-        correct = None
+    calibration_features = {}
+
+    # Preserve the actual quantitative
+    # feature values used by the model.
+    calibration_features[
+        "option_volume"
+    ] = mean([
+        features["options"]["NIFTY"][
+            "volume_balance"
+        ],
+        features["options"]["SENSEX"][
+            "volume_balance"
+        ]
+    ])
+
+    calibration_features[
+        "option_premium"
+    ] = mean([
+        features["options"]["NIFTY"][
+            "premium_balance"
+        ],
+        features["options"]["SENSEX"][
+            "premium_balance"
+        ]
+    ])
+
+    calibration_features[
+        "option_oi"
+    ] = mean([
+        features["options"]["NIFTY"][
+            "oi_balance"
+        ],
+        features["options"]["SENSEX"][
+            "oi_balance"
+        ]
+    ])
+
+    calibration_features[
+        "option_imbalance"
+    ] = mean([
+        features["options"]["NIFTY"][
+            "bid_ask_balance"
+        ],
+        features["options"]["SENSEX"][
+            "bid_ask_balance"
+        ]
+    ])
+
+    calibration_features[
+        "index_return"
+    ] = mean([
+        features["indices"]["NIFTY"][
+            "return_pct"
+        ] / 0.40,
+        features["indices"]["SENSEX"][
+            "return_pct"
+        ] / 0.40
+    ])
+
+    calibration_features[
+        "index_imbalance"
+    ] = mean([
+        features["indices"]["NIFTY"][
+            "imbalance"
+        ],
+        features["indices"]["SENSEX"][
+            "imbalance"
+        ]
+    ])
+
+    calibration_features[
+        "heavyweights"
+    ] = features[
+        "heavyweights"
+    ][
+        "average_score"
+    ]
+
+    calibration_features[
+        "momentum"
+    ] = mean([
+        features["window"]["NIFTY"][
+            "momentum"
+        ] / 0.20,
+        features["window"]["SENSEX"][
+            "momentum"
+        ] / 0.20
+    ])
 
     record = {
-        "date": now_ist().strftime(
-            "%Y-%m-%d"
-        ),
-        "timestamp": now_ist().isoformat(),
-        "priority": priority,
-        "prediction": final_direction,
-        "confidence": final_confidence,
-        "actual": actual_direction,
-        "correct": correct,
+        "timestamp":
+            timestamp(),
+        "prediction_time":
+            state[
+                "prediction_time"
+            ],
+        "baseline_time":
+            baseline[
+                "timestamp"
+            ],
+        "outcome_time":
+            outcome_snapshot[
+                "timestamp"
+            ],
+        "priority":
+            priority,
+        "prediction":
+            signal[
+                "direction"
+            ],
+        "confidence":
+            signal[
+                "confidence"
+            ],
+        "nifty_score":
+            signal[
+                "nifty_score"
+            ],
+        "sensex_score":
+            signal[
+                "sensex_score"
+            ],
+        "outcome_direction":
+            outcome[
+                "direction"
+            ],
         "outcome_move_pct":
-            actual.get(
-                "move_pct",
-                0,
-            ),
-        "features": p["features"],
-        "score": p["score"],
+            outcome[
+                "move_pct"
+            ],
+        "correct":
+            evaluation[
+                "correct"
+            ],
+        "evaluation":
+            evaluation[
+                "evaluation"
+            ],
+        "features":
+            calibration_features,
+        "regime":
+            features[
+                "regime"
+            ],
+        "sample_count":
+            features[
+                "sample_count"
+            ]
     }
 
-    save_record(record)
-
-    print(
-        "Calibration record saved:",
-        json.dumps(
-            record,
-            indent=2,
-        ),
+    save_calibration(
+        record
     )
 
-    # Send evaluation update.
-    if correct is True:
-        result_text = "✅ Prediction confirmed"
+    # ----------------------------------------
+    # Historical calibration status.
+    # ----------------------------------------
 
-    elif correct is False:
-        result_text = "❌ Prediction failed"
+    rows = load_calibration()
 
+    accuracy = (
+        historical_direction_accuracy(
+            rows
+        )
+    )
+
+    # ----------------------------------------
+    # Send outcome.
+    # ----------------------------------------
+
+    outcome_message = (
+        format_outcome_message(
+            signal,
+            outcome,
+            evaluation
+        )
+    )
+
+    try:
+        telegram_send(
+            outcome_message
+        )
+
+    except Exception as exc:
+        print(
+            "Telegram outcome error:",
+            exc
+        )
+
+    # ----------------------------------------
+    # Final console report.
+    # ----------------------------------------
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "CAS SESSION COMPLETE"
+    )
+
+    print(
+        "Prediction:",
+        signal["direction"]
+    )
+
+    print(
+        "Confidence:",
+        signal["confidence"]
+    )
+
+    print(
+        "Actual:",
+        outcome["direction"]
+    )
+
+    print(
+        "15:15 -> 15:30:",
+        f"{outcome['move_pct']:+.2f}%"
+    )
+
+    if accuracy is not None:
+        print(
+            "Historical accuracy:",
+            f"{accuracy * 100:.1f}%"
+        )
     else:
-        result_text = "🟡 Neutral / not scored"
+        print(
+            "Historical accuracy:",
+            "Not enough samples"
+        )
 
-    evaluation = (
-        "\n\n📈 CAS 3:30 EVALUATION\n"
-        f"Priority: {priority}\n"
-        f"Prediction: {final_direction}\n"
-        f"3:15 → 3:30: "
-        f"{actual.get('move_pct', 0):+.2f}%\n"
-        f"Outcome: {actual_direction}\n"
-        f"{result_text}"
-    )
-
-    send_telegram(
-        message + evaluation
+    print(
+        "Calibration samples:",
+        len(rows)
     )
 
     print(
-        "CAS completed:",
-        now_ist().isoformat(),
+        "=" * 60
     )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except Exception as exc:
+        print(
+            "FATAL CAS ENGINE ERROR:",
+            repr(exc)
+        )
+
+        # Try to notify Telegram.
+        try:
+            telegram_send(
+                "🚨 CAS ENGINE ERROR\n\n"
+                + str(exc)[:3500]
+            )
+        except Exception:
+            pass
+
+        raise
